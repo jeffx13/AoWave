@@ -42,3 +42,61 @@ jobs:
 
       - name: Build
         run: cmake --build --preset debug
+
+  # A push to main whose version (project() in CMakeLists.txt) has no release yet publishes one:
+  # the packaged zip, tagged v<version>. Bump the version to release; other pushes skip this.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Is this version released yet?
+        run: |
+          $version = [regex]::Match((Get-Content CMakeLists.txt -Raw), 'project\(\w+ VERSION ([\d.]+)').Groups[1].Value
+          if (-not $version) { throw "no version in CMakeLists.txt" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          gh release view "v$version" *> $null
+          if ($LASTEXITCODE -eq 0) { "new=false" >> $env:GITHUB_OUTPUT; "v$version is already released" }
+          else { "new=true" >> $env:GITHUB_OUTPUT; "v$version is new" }
+          exit 0
+
+      - if: steps.version.outputs.new == 'true'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          arch: win64_msvc2022_64
+          modules: qtwebengine qtwebchannel qtpositioning qtshadertools
+          aqtsource: git+https://github.com/jdpurcell/aqtinstall.git@6f0f842da47c744cdc814cd94da9828d934d7bf0
+          cache: true
+
+      - if: steps.version.outputs.new == 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - if: steps.version.outputs.new == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            third-parties/bin
+            third-parties/lib
+          key: deps-${{ hashFiles('scripts/download-tools.ps1') }}
+
+      - if: steps.version.outputs.new == 'true'
+        name: Package
+        run: |
+          if (-not (Test-Path third-parties\bin\ffmpeg.exe)) { powershell -ExecutionPolicy Bypass -File scripts/download-tools.ps1 }
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          $env:QT_DIR = $env:QT_ROOT_DIR
+          powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+
+      - if: steps.version.outputs.new == 'true'
+        name: Publish the release
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          gh release create "v$v" (Get-ChildItem dist\*.zip).FullName --title "AoWave $v" --generate-notes --target $env:GITHUB_SHA

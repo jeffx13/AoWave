@@ -19,7 +19,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "")
 
-project(app VERSION 0.1 LANGUAGES CXX)
+project(app VERSION 1.0 LANGUAGES CXX)
 
 # The product name lives here. MAIN_MODULE_URI is the internal QML module name.
 
