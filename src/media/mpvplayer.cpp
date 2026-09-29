@@ -1,0 +1,1635 @@
+#include "media/mpvplayer.h"
+#include "media/trackprefs.h"
+#include "core/async.h"
+#include "core/settings.h"
+#include "core/config.h"
+#include <QClipboard>
+#include <QColor>
+#include <QDateTime>
+#include <QImage>
+#include <QScopeGuard>
+#include <cstring>
+#include <QDir>
+#include <QDirIterator>
+#include "platform/platform.h"
+#include <QFileInfo>
+#include <QtConcurrent/QtConcurrentRun>
+#include <QCoreApplication>
+#include <QMetaType>
+#include <QOpenGLContext>
+#include <QStandardPaths>
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <stdexcept>
+#include <QStringList>
+#include <QQuickOpenGLUtils>
+#include <QtOpenGL/QOpenGLFramebufferObject>
+#include <QOpenGLFunctions>
+#include <QGuiApplication>
+#include <QScreen>
+#include "core/appshell.h"
+#include "core/logger.h"
+#include "media/danmaku.h"
+#include "platform/platform.h"
+#include <mpv/render_gl.h>
+
+namespace {
+void keepDisplayAwake() { Platform::keepDisplayAwake(); }
+void allowDisplaySleep() { Platform::allowDisplaySleep(); }
+
+// Comes back as the property-change event's reply_userdata.
+enum class Observed : uint64_t {
+    Duration, PlaybackTime, PausedForCache, BaseIdle, Pause, TrackList, GlslShaders,
+    AudioId, SubtitleId, SecondarySubtitleId, SecondarySubtitleText, SubtitleScale,
+    SubtitleDelay, VideoId, CacheEnd, LoopA, LoopB, EofReached,
+};
+
+constexpr const char *kObservedProperties[] = {
+    "duration", "playback-time", "paused-for-cache", "base-idle", "pause", "track-list",
+    "glsl-shaders", "aid", "sid", "secondary-sid", "secondary-sub-text", "sub-scale",
+    "sub-delay", "vid", "demuxer-cache-time", "ab-loop-a", "ab-loop-b", "eof-reached",
+};
+static_assert(std::size(kObservedProperties) == size_t(Observed::EofReached) + 1,
+              "kObservedProperties must list every Observed property, in the same order");
+
+}
+
+// A private thread and second context makes the driver sync every shader pass.
+class MpvRenderer : public QQuickFramebufferObject::Renderer {
+    MpvPlayer *m_obj;
+    bool m_visible = true;
+
+public:
+    MpvRenderer(MpvPlayer *obj) : m_obj(obj) {}
+    ~MpvRenderer() override { m_obj->freeMpvRenderContext(); }
+
+    void synchronize(QQuickFramebufferObject *item) override { m_visible = item->isVisible(); }
+
+    QOpenGLFramebufferObject *createFramebufferObject(const QSize &size) override {
+        QOpenGLFramebufferObjectFormat fmt;
+        fmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+        fmt.setSamples(0);
+        fmt.setMipmap(false);
+        return new QOpenGLFramebufferObject(m_obj->clampRenderSize(size), fmt);
+    }
+
+    void render() override {
+        QOpenGLFramebufferObject *target = framebufferObject();
+        if (!target || !m_obj->ensureMpvRenderContext()) return;
+
+        QQuickOpenGLUtils::resetOpenGLState();
+        if (!m_visible) {
+            auto *gl = QOpenGLContext::currentContext()->functions();
+            gl->glClearColor(0.f, 0.f, 0.f, 1.f);
+            gl->glClear(GL_COLOR_BUFFER_BIT);
+            QQuickOpenGLUtils::resetOpenGLState();
+            return;
+        }
+
+        mpv_opengl_fbo mpfbo{static_cast<int>(target->handle()), target->width(), target->height(), 0};
+        int flip_y = 0;
+        // The scene graph presents, not mpv; its default hands frames over late.
+        int blockForTargetTime = 0;
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &mpfbo},
+            {MPV_RENDER_PARAM_FLIP_Y, &flip_y},
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &blockForTargetTime},
+            {MPV_RENDER_PARAM_INVALID, nullptr}
+        };
+        m_obj->handle().render(params);
+        QQuickOpenGLUtils::resetOpenGLState();
+    }
+};
+
+MpvPlayer::MpvPlayer(QQuickItem *parent) : QQuickFramebufferObject(parent) {
+    s_instance.store(this, std::memory_order_release);
+    // QScreen is not safe off the GUI thread.
+    QSize cap;
+    if (QScreen *s = QGuiApplication::primaryScreen())
+        cap = (QSizeF(s->size()) * s->devicePixelRatio()).toSize();
+    if (cap.isEmpty()) cap = QSize(1920, 1080);
+    m_maxRenderSize.store(cap.boundedTo(QSize(3840, 3840)), std::memory_order_relaxed);
+    m_time.store(0, std::memory_order_relaxed);
+    m_duration.store(0, std::memory_order_relaxed);
+    int vol = Settings::instance().get(Config::Volume);
+    m_volume = (vol >= 0 && vol <= 200) ? vol : 100;
+    double speed = Settings::instance().get(Config::Speed);
+    m_speed = (speed > 0.0 && speed <= 10.0) ? static_cast<float>(speed) : 1.0f;
+
+    connect(this, &QQuickItem::windowChanged, this, [this]() { recomputeMaxRenderSize(); });
+    // Yours to edit in data\mpv, which starts as a copy of the config the app ships.
+    QDir mpvDir(Settings::dataDir() + QStringLiteral("/mpv"));
+    if (!mpvDir.exists()) {
+        const QString defaults = Platform::moduleDir() + QStringLiteral("/mpv");
+        QDirIterator files(defaults, QDir::Files, QDirIterator::Subdirectories);
+        while (files.hasNext()) {
+            const QString file = files.next();
+            const QString copy = mpvDir.path() + file.mid(defaults.size());
+            QDir().mkpath(QFileInfo(copy).path());
+            QFile::copy(file, copy);
+        }
+    }
+    if (!mpvDir.exists())
+        mpvDir = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/../mpv");
+    if (mpvDir.exists()) {
+        m_mpv.set_option("config-dir", mpvDir.absolutePath().toLocal8Bit().constData());
+        m_mpv.set_option("config", "yes");
+    }
+    // mpv looks for yt-dlp beside the exe, and the app keeps it beside its own binaries.
+    m_mpv.set_option("script-opts",
+                     ("ytdl_hook-ytdl_path=" + Settings::toolPath(QStringLiteral("yt-dlp.exe"))).toUtf8().constData());
+
+    m_mpv.set_option("ytdl", Settings::instance().mpvYtdlEnabled());
+    m_mpv.set_option("pause", false);
+    m_mpv.set_option("softvol", true);
+    m_mpv.set_option("vo", "libmpv");
+    m_mpv.set_option("keep-open", true);
+    m_mpv.set_option("screenshot-directory",
+                     QStandardPaths::writableLocation(QStandardPaths::PicturesLocation).toUtf8().constData());
+
+    // vid/aid/sid are sticky: an id from Bilibili's external tracks names nothing in the next
+    // file, and mpv then plays no video at all.
+    m_mpv.set_option("reset-on-next-file",
+                     "video-aspect-override,af,audio-delay,pause,vid,aid,sid,secondary-sid,"
+                     "ab-loop-a,ab-loop-b");
+
+    m_mpv.set_option("hwdec", "auto");
+
+    m_mpv.set_option("cache", "yes");
+    m_mpv.set_option("cache-secs", "100");
+    m_mpv.set_option("cache-unlink-files", "whendone");
+    const bool mpvLogOn = Settings::instance().mpvLogEnabled();
+    m_mpv.set_option("msg-level", mpvLogOn ? "all=v" : "all=error");
+    m_mpv.set_option("force-seekable", "yes");
+    m_mpv.set_option("cookies", "no");
+    // Some CDNs serve valid streams behind certs the OS distrusts.
+    m_mpv.set_option("tls-verify", "no");
+    m_mpv.set_option("sub-ass-override", "scale");
+
+    for (size_t i = 0; i < std::size(kObservedProperties); ++i)
+        m_mpv.observe_property(i, kObservedProperties[i]);
+    m_mpv.request_log_messages(mpvLogOn ? "info" : "error");
+
+    QObject::connect(&Settings::instance(), &Settings::subStyleChanged, this, &MpvPlayer::applySubtitleStyle);
+    QObject::connect(&Settings::instance(), &Settings::pictureChanged, this, &MpvPlayer::applyPicture);
+    QObject::connect(&Settings::instance(), &Settings::normalizeAudioChanged, this, [this]() {
+        applyAudioNormalization();
+        showText(Settings::instance().normalizeAudio() ? tr("Volume normalisation on")
+                                                       : tr("Volume normalisation off"));
+    });
+
+    QObject::connect(&Settings::instance(), &Settings::mpvYtdlEnabledChanged, this, [this]() {
+        bool enabled = Settings::instance().mpvYtdlEnabled();
+        m_mpv.set_property_async("ytdl", enabled);
+        showText(enabled ? tr("ytdl on") : tr("ytdl off"));
+    });
+
+    m_danmakuRefresh.setSingleShot(true);
+    m_danmakuRefresh.setInterval(100);
+    connect(&m_danmakuWriter, &QFutureWatcher<QString>::finished, this, [this]() {
+        attachDanmakuTrack();
+        if (std::exchange(m_danmakuRewrite, false)) writeDanmaku();
+    });
+    connect(&m_danmakuFetch, &QFutureWatcher<QList<DanmakuComment>>::finished, this, [this]() {
+        if (m_danmakuFetch.future().resultCount() == 0 || m_danmakuFetchKey != m_danmakuKey) return;
+        m_danmaku = m_danmakuFetch.result();
+        rebuildDanmakuHeat();
+        if (m_danmaku.isEmpty()) return;
+        // Held, not discarded: the switch writes them back without a second fetch.
+        if (!DanmakuOptions::current().enabled) {
+            logInfo() << "Danmaku" << m_danmaku.size() << "comments held - danmaku is off";
+            return;
+        }
+        writeDanmaku();
+    });
+    connect(&m_danmakuRefresh, &QTimer::timeout, this, &MpvPlayer::refreshDanmaku);
+    QObject::connect(&Settings::instance(), &Settings::danmakuStyleChanged, this,
+                     [this]() { m_danmakuRefresh.start(); });
+
+    QObject::connect(&Settings::instance(), &Settings::danmakuEnabledChanged, this, [this]() {
+        const int index = danmakuTrackIndex();
+        const qint64 id = index >= 0 ? m_subtitleListModel.idForIndex(index) : 0;
+        if (!Settings::instance().danmakuEnabled()) {
+            if (id != 0 && m_primarySubId == id) setPrimarySub(0);
+            restoreTrackPrefs();
+        } else if (id != 0) {
+            setPrimarySub(id);
+        } else {
+            ensureDanmaku();
+        }
+    });
+
+    QObject::connect(&Settings::instance(), &Settings::mpvLogEnabledChanged, this, [this]() {
+        bool enabled = Settings::instance().mpvLogEnabled();
+        m_mpv.set_property_async("msg-level", enabled ? "all=v" : "all=error");
+        m_mpv.request_log_messages(enabled ? "info" : "error");
+    });
+
+    if (Settings::instance().get(Config::LimitCache)) {
+        int64_t forwardBytes  = Settings::instance().get(Config::ForwardCache)  << 20;
+        int64_t backwardBytes = Settings::instance().get(Config::BackwardCache) << 20;
+        m_mpv.set_option("demuxer-max-bytes", forwardBytes);
+        m_mpv.set_option("demuxer-max-back-bytes", backwardBytes);
+    }
+
+    if (m_mpv.initialize() < 0)
+        throw std::runtime_error("could not initialize mpv context");
+
+    m_mpv.set_property("volume", static_cast<double>(m_volume));
+    m_mpv.set_property("speed",  static_cast<double>(m_speed));
+
+    m_mpv.set_wakeup_callback(
+        [](void *ctx) {
+            MpvPlayer *obj = static_cast<MpvPlayer *>(ctx);
+            QMetaObject::invokeMethod(obj, "onMpvEvent", Qt::QueuedConnection);
+        },
+        this);
+
+}
+
+MpvPlayer::~MpvPlayer() {
+    s_instance.store(nullptr, std::memory_order_release);
+    waitFor(m_danmakuWriter, "MpvPlayer danmaku writer");
+    const char *stopCmd[] = {"stop", nullptr};
+    m_mpv.command(stopCmd);   // terminate_destroy alone lets it play on
+}
+
+void MpvPlayer::recomputeMaxRenderSize() {
+    QScreen *s = window() ? window()->screen() : QGuiApplication::primaryScreen();
+    QSize sz = s ? (QSizeF(s->size()) * s->devicePixelRatio()).toSize() : QSize();
+    if (sz.isEmpty()) sz = QSize(1920, 1080);
+    sz = sz.boundedTo(QSize(3840, 3840));
+    if (sz == m_maxRenderSize.load(std::memory_order_relaxed)) return;
+    m_maxRenderSize.store(sz, std::memory_order_relaxed);
+    if (window()) connect(window(), &QWindow::screenChanged, this,
+                          [this]() { recomputeMaxRenderSize(); update(); }, Qt::UniqueConnection);
+    update();
+}
+
+bool MpvPlayer::ensureMpvRenderContext() {
+    if (m_renderCtxInited) return true;
+
+    // No context pointer: the callback finds the current context itself.
+    mpv_opengl_init_params gl_init {
+        [](void *, const char *name) -> void * {
+            QOpenGLContext *c = QOpenGLContext::currentContext();
+            return c ? reinterpret_cast<void *>(c->getProcAddress(QByteArray(name))) : nullptr;
+        },
+        nullptr
+    };
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_OPENGL)},
+        {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init},
+        {MPV_RENDER_PARAM_INVALID, nullptr}
+    };
+    if (m_mpv.renderer_initialize(params) < 0) {
+        logError() << "Mpv" << "renderer_initialize failed";
+        return false;
+    }
+    m_mpv.set_render_callback([](void *ctx) {
+        auto *self = static_cast<MpvPlayer *>(ctx);
+        QMetaObject::invokeMethod(self, [self]() { self->update(); }, Qt::QueuedConnection);
+    }, this);
+    m_renderCtxInited = true;
+    return true;
+}
+
+void MpvPlayer::freeMpvRenderContext() {
+    if (!m_renderCtxInited) return;
+    m_renderCtxInited = false;
+    m_mpv.set_render_callback(nullptr, nullptr);
+    m_mpv.free_renderer();
+}
+
+QSize MpvPlayer::clampRenderSize(QSize itemPx) const {
+    const QSize cap = m_maxRenderSize.load(std::memory_order_relaxed);
+    if (itemPx.isEmpty()) return cap;
+
+    QSize sz = itemPx;
+    if (sz.width() > cap.width() || sz.height() > cap.height())
+        sz = sz.scaled(cap, Qt::KeepAspectRatio);
+
+    // Anime4K AutoDownscalePre only fires at OUTPUT.w/NATIVE.w in (1.2, 2.0) or (2.4, 4.0).
+    const int nativeW = m_videoWidth.load(std::memory_order_relaxed);
+    if (m_bandClamp.load(std::memory_order_relaxed) && nativeW > 0) {
+        const double r = double(sz.width()) / double(nativeW);
+        const double target = (r < 1.26) ? 1.26 : (r >= 1.99 && r < 2.46 ? 2.46 : 0.0);
+        if (target > r && target <= r * 2.0) {
+            sz = (QSizeF(sz) * (target / r)).toSize();
+            if (sz.width() > 4096 || sz.height() > 4096)
+                sz = sz.scaled(QSize(4096, 4096), Qt::KeepAspectRatio);
+        }
+    }
+
+    if (sz.width() < 64 || sz.height() < 64) {
+        const double s = qMax(64.0 / qMax(1, sz.width()), 64.0 / qMax(1, sz.height()));
+        sz = (QSizeF(sz) * s).toSize();
+    }
+    return sz;
+}
+
+void MpvPlayer::open(PlayInfo &playItem) {
+    if (playItem.videos.isEmpty()) return;
+
+    if (playItem.refreshPrimaryVideoUrl) {
+        const QUrl refreshed = playItem.refreshPrimaryVideoUrl();
+        if (!refreshed.isEmpty() && refreshed.isValid())
+            playItem.videos[0].url = refreshed;
+    }
+
+    setLoading(true);
+    m_openPending = true;
+    m_fileLoaded = false;
+    m_duration.store(0, std::memory_order_relaxed);
+    m_time.store(0, std::memory_order_relaxed);
+    emit durationChanged();
+    emit timeChanged();
+
+    m_state = Stopped;
+    emit mpvStateChanged();
+
+    m_seekFraction = playItem.progress;
+    m_danmaku.clear();
+    rebuildDanmakuHeat();
+    m_danmakuKey = playItem.danmakuKey;
+    m_danmakuSource = playItem.danmakuSource;
+    startDanmakuFetch();
+
+    std::stable_sort(playItem.videos.begin(), playItem.videos.end(),
+                     [](const Video &a, const Video &b) {
+                         if (a.height != b.height) return a.height > b.height;
+                         return a.bitrate > b.bitrate;
+                     });
+
+    std::stable_sort(playItem.audios.begin(), playItem.audios.end(),
+                     [](const Track &a, const Track &b) {
+                         return a.bitrate > b.bitrate;
+                     });
+
+    setHeaders(playItem.headers);
+
+    QByteArray videoUrlData = (playItem.videos[0].url.isLocalFile()
+                                   ? playItem.videos[0].url.toLocalFile()
+                                   : playItem.videos[0].url.toString()).toUtf8();
+    const char *args[] = {"loadfile", videoUrlData.constData(), nullptr};
+    m_mpv.command_async(args);
+
+    m_audiosToBeAdded = playItem.audios;
+    m_subtitlesToBeAdded = playItem.subtitles;
+    m_videosToBeAdded = playItem.videos;
+
+    m_currentVideoUrl = playItem.videos[0].url;
+    AppShell::instance().navigateTo(AppShell::Page::Player);
+}
+
+void MpvPlayer::play() {
+    if (m_state == Paused)
+        m_mpv.set_property_async("pause", false);
+}
+
+void MpvPlayer::pause() {
+    if (m_state == Playing)
+        m_mpv.set_property_async("pause", true);
+}
+
+void MpvPlayer::togglePlayPause() {
+    if (m_state == Playing) pause();
+    else                          play();
+}
+
+void MpvPlayer::stop() {
+    const char *args[] = {"stop", nullptr};
+    m_mpv.command_async(args);
+}
+
+void MpvPlayer::setSubDelay(double seconds) {
+    seconds = qBound(-60.0, seconds, 60.0);
+    seconds = qRound(seconds * 10.0) / 10.0;
+    if (qFuzzyCompare(m_subDelay + 1.0, seconds + 1.0)) return;
+    m_subDelay = seconds;
+    m_mpv.set_property_async("sub-delay", seconds);
+    showText(tr("Subtitle delay: %1s").arg(seconds, 0, 'f', 1));
+    emit subDelayChanged();
+}
+
+void MpvPlayer::setSpeed(float speed) {
+    speed = qBound(0.1f, speed, 10.0f);
+    if (m_speed == speed) return;
+    m_speed = speed;
+    m_mpv.set_property_async("speed", static_cast<double>(speed) * (m_speedBoost ? 2 : 1));
+    showText(m_speedBoost ? tr("Speed: %1x (held at %2x)").arg(speed).arg(speed * 2)
+                          : tr("Speed: %1x").arg(speed));
+    emit speedChanged();
+    Settings::instance().set(Config::Speed, static_cast<double>(speed));
+    // Kept per show too: before, only a track change happened to store it.
+    if (!m_applyingTrackPrefs && m_fileLoaded && !m_showKey.isEmpty()) saveTrackPrefs();
+}
+
+void MpvPlayer::seek(double time, bool absolute) {
+    if (m_state == Stopped || !std::isfinite(time)) return;
+    if (absolute && time == m_time.load(std::memory_order_relaxed)) return;
+    if (absolute && time < 0) time = 0;
+    QByteArray time_str = QByteArray::number(time, 'f', 3);
+    const char *args[] = {"seek", time_str.constData(),
+                          absolute ? "absolute" : "relative", nullptr};
+    m_mpv.command_async(args);
+}
+
+void MpvPlayer::setVolume(int volume) {
+    volume = qBound(0, volume, 200);
+    if (m_volume == volume) return;
+    m_volume = volume;
+    m_mpv.set_property_async("volume", static_cast<double>(volume));
+    showText(tr("Volume: %1%").arg(volume));
+    emit volumeChanged();
+    if (volume > 0)
+        Settings::instance().set(Config::Volume, volume);
+}
+
+void MpvPlayer::setSubVisible(bool subVisible) {
+    if (subVisible && m_primarySubId == 0 && m_secondarySubId == 0
+                   && m_subtitleListModel.count() > 0) {
+        setSubIndex(0);
+        return;
+    }
+    if (m_subVisible == subVisible) return;
+    m_subVisible = subVisible;
+    m_mpv.set_property_async("sub-visibility", m_subVisible);
+    m_mpv.set_property_async("secondary-sub-visibility", m_subVisible);
+    emit subVisibleChanged();
+    if (!m_applyingTrackPrefs) saveTrackPrefs();
+}
+
+bool MpvPlayer::addVideo(const Track &video) {
+    if (m_state == Stopped) return false;
+    if (!m_videoListModel.append(video.url, video.title, video.lang, video.height)) return true;
+    QByteArray url = (video.url.isLocalFile() ? video.url.toLocalFile() : video.url.toString()).toUtf8();
+    const char *args[] = {"video-add", url.constData(), "auto", "", nullptr};
+    m_mpv.command_async(args);
+    return true;
+}
+
+void MpvPlayer::sendKeyPress(const QString &key) {
+    if (key.isEmpty() || key.endsWith('+')) return;
+    QByteArray cmd = key.toUtf8();
+    const char *args[] = {"keypress", cmd.constData(), nullptr};
+    m_mpv.command_async(args);
+}
+
+bool MpvPlayer::addAudio(const Track &audio, bool select) {
+    if (m_state == Stopped) return false;
+    if (!m_audioListModel.append(audio.url, audio.title, audio.lang)) return true;
+    QByteArray url = (audio.url.isLocalFile() ? audio.url.toLocalFile() : audio.url.toString()).toUtf8();
+    QByteArray title = audio.title.toUtf8();
+    const char *mode = select ? "select" : "auto";
+    const char *args[] = {"audio-add", url.constData(), mode, title.constData(), "", nullptr};
+    m_mpv.command_async(args);
+    return true;
+}
+
+bool MpvPlayer::addSubtitle(const Track &subtitle) {
+    if (m_state == Stopped) return false;
+    if (!m_subtitleListModel.append(subtitle.url, subtitle.title, subtitle.lang)) return true;
+    QByteArray url = (subtitle.url.isLocalFile() ? subtitle.url.toLocalFile() : subtitle.url.toString()).toUtf8();
+    QByteArray title = subtitle.title.toUtf8();
+    QByteArray lang = subtitle.lang.toUtf8();
+    const QString l = subtitle.lang.toLower();
+    const bool isEnglish = l == "en" || l == "eng" || l.startsWith("en-") || l.startsWith("en_")
+                           || subtitle.title.contains("english", Qt::CaseInsensitive);
+    const bool isDanmaku = l == "danmaku";
+    const char *args[] = {"sub-add", url.constData(),
+                          (isEnglish || isDanmaku) ? "select" : "auto",
+                          title.constData(), lang.constData(), nullptr};
+    m_mpv.command_async(args);
+    return true;
+}
+
+int MpvPlayer::danmakuTrackIndex() const {
+    for (int i = 0; i < m_subtitleListModel.count(); ++i) {
+        const Track *track = m_subtitleListModel.at(i);
+        if (track && track->lang == QLatin1String("danmaku")) return i;
+    }
+    return -1;
+}
+
+void MpvPlayer::refreshDanmaku() {
+    if (m_state == Stopped || danmakuTrackIndex() < 0) return;
+    writeDanmaku();
+}
+
+void MpvPlayer::startDanmakuFetch() {
+    if (!m_danmakuSource || m_danmakuKey.isEmpty()) return;
+    if (!DanmakuOptions::current().enabled) {
+        logInfo() << "Danmaku" << "not fetching - turned off in settings";
+        return;
+    }
+    const QFuture<QList<DanmakuComment>> future = m_danmakuSource();
+    m_danmakuFetchKey = m_danmakuKey;
+    if (future.isFinished()) {
+        m_danmaku = future.resultCount() > 0 ? future.result() : QList<DanmakuComment>{};
+        rebuildDanmakuHeat();
+        if (m_danmaku.isEmpty()) return;
+        writeDanmaku();
+        return;
+    }
+    m_danmakuFetch.setFuture(future);
+}
+
+// Normalised against a high percentile: one 900-comment spike would flatten the rest.
+void MpvPlayer::rebuildDanmakuHeat() {
+    constexpr int kBuckets = 160;
+    const double duration = preciseDuration();
+    if (m_danmaku.isEmpty() || duration <= 1.0) {
+        if (m_danmakuHeat.isEmpty()) return;
+        m_danmakuHeat.clear();
+        emit danmakuHeatChanged();
+        return;
+    }
+
+    QList<int> counts(kBuckets, 0);
+    for (const DanmakuComment &c : std::as_const(m_danmaku)) {
+        const int bucket = int(c.timeMs / 1000.0 / duration * kBuckets);
+        if (bucket >= 0 && bucket < kBuckets) ++counts[bucket];
+    }
+
+    QList<int> sorted = counts;
+    std::sort(sorted.begin(), sorted.end());
+    const double ceiling = qMax(1, sorted.at(int(kBuckets * 0.97)));
+
+    QVariantList heat;
+    heat.reserve(kBuckets);
+    for (int n : std::as_const(counts)) {
+        heat.append(qMin(1.0, std::sqrt(n / ceiling)));
+    }
+    m_danmakuHeat = std::move(heat);
+    emit danmakuHeatChanged();
+}
+
+void MpvPlayer::writeDanmaku() {
+    if (m_danmaku.isEmpty() || m_danmakuKey.isEmpty()) return;
+    if (m_danmakuWriter.isRunning()) { m_danmakuRewrite = true; return; }
+    m_danmakuWriterKey = m_danmakuKey;
+    m_danmakuWriter.setFuture(QtConcurrent::run(
+        [comments = m_danmaku, key = m_danmakuKey, opt = DanmakuOptions::current(),
+         dir = Settings::tempDir() + QStringLiteral("/danmaku")] {
+            return DanmakuAss::writeFile(comments, key, opt, dir);
+        }));
+}
+
+void MpvPlayer::attachDanmakuTrack() {
+    if (m_danmakuWriter.future().resultCount() == 0 || m_danmakuWriter.result().isEmpty()) {
+        logWarn() << "Danmaku" << "the ASS writer produced no file; no track to attach";
+        return;
+    }
+    if (m_danmakuWriterKey != m_danmakuKey) {
+        logInfo() << "Danmaku" << "discarding a file written for the previous episode";
+        return;
+    }
+    // Not QUrl(path): a drive letter parses as the scheme.
+    const Track track(QUrl::fromLocalFile(m_danmakuWriter.result()),
+                      QStringLiteral("弹幕"), QStringLiteral("danmaku"));
+    const int index = danmakuTrackIndex();
+    if (index < 0) {
+        logOk() << "Danmaku" << "attaching" << m_danmakuWriter.result()
+                << (m_state == Stopped ? "(queued until the file loads)" : "(now)");
+        if (m_state == Stopped) m_subtitlesToBeAdded.append(track);
+        else                    addSubtitle(track);
+        return;
+    }
+    // Only once mpv has reported it: before that the row has a placeholder id and sub-reload
+    // does nothing.
+    if (!m_subtitleListModel.hasRealId(index)) {
+        logInfo() << "Danmaku" << "track row exists but mpv has not reported it yet; re-adding";
+        addSubtitle(track);
+        return;
+    }
+    // mpv's own "select" on sub-add loses to any sid written in the same batch of events.
+    if (Settings::instance().danmakuEnabled()
+        && m_primarySubId != m_subtitleListModel.idForIndex(index)) {
+        setPrimarySub(m_subtitleListModel.idForIndex(index));
+    }
+    const QByteArray id = QByteArray::number(qlonglong(m_subtitleListModel.idForIndex(index)));
+    const char *args[] = {"sub-reload", id.constData(), nullptr};
+    if (m_mpv.command(args) < 0)
+        logWarn() << "Danmaku" << "sub-reload failed for track" << id;
+}
+
+void MpvPlayer::screenshot() {
+    if (m_state == Stopped) return;
+    const char *args[] = {"osd-msg", "screenshot", nullptr};
+    m_mpv.command_async(args);
+}
+
+void MpvPlayer::copyFrame() {
+    if (m_state == Stopped) return;
+    const char *args[] = {"screenshot-raw", "video", nullptr};
+    mpv_node frame{};
+    if (m_mpv.command_ret(args, &frame) < 0) {
+        showText(tr("Could not copy the frame"));
+        return;
+    }
+    const auto release = qScopeGuard([&frame] { mpv_free_node_contents(&frame); });
+
+    int64_t width = 0, height = 0, stride = 0;
+    QByteArray format;
+    const mpv_byte_array *pixels = nullptr;
+    if (frame.format == MPV_FORMAT_NODE_MAP) {
+        for (int i = 0; i < frame.u.list->num; ++i) {
+            const char *key = frame.u.list->keys[i];
+            const mpv_node &field = frame.u.list->values[i];
+            if (!std::strcmp(key, "w"))           width  = field.u.int64;
+            else if (!std::strcmp(key, "h"))      height = field.u.int64;
+            else if (!std::strcmp(key, "stride")) stride = field.u.int64;
+            else if (!std::strcmp(key, "format")) format = field.u.string;
+            else if (!std::strcmp(key, "data"))   pixels = field.u.ba;
+        }
+    }
+    // bgr0 and bgra are Qt's RGB32 and ARGB32 in memory.
+    if (width <= 0 || height <= 0 || !pixels || (format != "bgr0" && format != "bgra")) {
+        showText(tr("Could not copy the frame"));
+        return;
+    }
+    const QImage view(static_cast<const uchar *>(pixels->data), int(width), int(height), qsizetype(stride),
+                      format == "bgra" ? QImage::Format_ARGB32 : QImage::Format_RGB32);
+    QGuiApplication::clipboard()->setImage(view.convertToFormat(QImage::Format_RGB888));
+    showText(tr("Frame copied"));
+}
+
+void MpvPlayer::cycleABLoop() {
+    if (m_state == Stopped) return;
+    const char *args[] = {"osd-msg", "ab-loop", nullptr};
+    m_mpv.command_async(args);
+}
+
+// reset-on-next-file clears af, so each file adds it again.
+void MpvPlayer::setSpeedBoost(bool on) {
+    if (m_speedBoost == on) return;
+    m_speedBoost = on;
+    const double effective = static_cast<double>(m_speed) * (on ? 2 : 1);
+    m_mpv.set_property_async("speed", effective);
+    showText(tr("Speed: %1x").arg(effective));
+}
+
+void MpvPlayer::applySubtitleStyle() {
+    const Settings &settings = Settings::instance();
+    setMpvProperty(QStringLiteral("sub-font"),
+                   settings.subFont().isEmpty() ? QStringLiteral("sans-serif") : settings.subFont());
+    setMpvProperty(QStringLiteral("sub-color"), settings.subColor());
+    setMpvProperty(QStringLiteral("sub-bold"), settings.subBold());
+    setMpvProperty(QStringLiteral("sub-border-size"), settings.subOutline());
+    setMpvProperty(QStringLiteral("sub-shadow-offset"), settings.subShadow());
+    // A box replaces the outline; its colour carries the opacity as alpha.
+    const int box = settings.subBackground();
+    setMpvProperty(QStringLiteral("sub-border-style"),
+                   box > 0 ? QStringLiteral("background-box") : QStringLiteral("outline-and-shadow"));
+    setMpvProperty(QStringLiteral("sub-back-color"),
+                   QColor(0, 0, 0, qRound(box * 2.55)).name(QColor::HexArgb));
+    setMpvProperty(QStringLiteral("sub-ass-override"),
+                   settings.subOverrideStyled() ? QStringLiteral("force") : QStringLiteral("scale"));
+}
+
+void MpvPlayer::applyPicture() {
+    // With the tab switched off the picture is left as it comes, whatever was set before.
+    const bool on = Settings::instance().pictureTab();
+    const QVariantMap picture = on ? Settings::instance().picture() : QVariantMap{};
+    for (const char *name : {"brightness", "contrast", "saturation", "gamma"})
+        setMpvProperty(QLatin1String(name), picture.value(QLatin1String(name)).toInt());
+    // GPU passes, so neither costs decoding speed the way a filter would.
+    setMpvProperty(QStringLiteral("sharpen"), picture.value(QStringLiteral("sharpen")).toDouble());
+    setMpvProperty(QStringLiteral("deband"), picture.value(QStringLiteral("deband")).toBool());
+}
+
+void MpvPlayer::applyAudioNormalization() {
+    const char *add[]    = {"af", "add", "@normalize:lavfi=[dynaudnorm=f=75:g=25:p=0.55]", nullptr};
+    const char *remove[] = {"af", "remove", "@normalize", nullptr};
+    m_mpv.command_async(Settings::instance().normalizeAudio() ? add : remove);
+}
+
+void MpvPlayer::onMpvEvent() {
+    while (true) {
+        const mpv_event *event = m_mpv.wait_event();
+        if (!event || event->event_id == MPV_EVENT_NONE) break;
+        switch (event->event_id) {
+        case MPV_EVENT_START_FILE:      onStartFile(); break;
+        case MPV_EVENT_FILE_LOADED:     onFileLoaded(); break;
+        case MPV_EVENT_END_FILE:        onEndFile(event); break;
+        case MPV_EVENT_IDLE:            onIdle(); break;
+        case MPV_EVENT_VIDEO_RECONFIG:  onVideoReconfig(); break;
+        case MPV_EVENT_LOG_MESSAGE:     onLogMessage(event); break;
+        case MPV_EVENT_PROPERTY_CHANGE: onPropertyChange(event); break;
+        default: break;
+        }
+    }
+}
+
+void MpvPlayer::onStartFile() {
+    m_openPending = false;
+    m_playNextEmitted = false;
+    if (std::exchange(m_nextIn, -1) != -1) emit nextInChanged();
+    m_subRestored = false;
+    m_videoPrefApplied = false;
+    m_audioPrefApplied = false;
+    m_speedPrefApplied = false;
+    m_videoWidth.store(0, std::memory_order_relaxed);
+    m_videoHeight.store(0, std::memory_order_relaxed);
+    emit videoSizeChanged();
+    m_time.store(0, std::memory_order_relaxed);
+    m_duration.store(0, std::memory_order_relaxed);
+    m_bufferedTime = 0;
+    m_buffering = false;
+    emit durationChanged();
+    emit bufferingChanged();
+    emit bufferedTimeChanged();
+    m_subVisible = true;
+    emit timeChanged();
+    emit subVisibleChanged();
+}
+
+// duration can arrive either side of file-loaded
+void MpvPlayer::applyPendingSeek() {
+    if (!m_fileLoaded || m_seekFraction <= 0) return;
+    const double total = preciseDuration();
+    if (total <= 0) return;
+    const double seconds = m_seekFraction * total;
+    seek(seconds, true);
+    m_seekFraction = 0;
+}
+
+void MpvPlayer::onFileLoaded() {
+    m_fileLoaded = true;
+    m_state = Playing;
+    keepDisplayAwake();
+
+    applyPendingSeek();
+    if (Settings::instance().normalizeAudio()) applyAudioNormalization();
+
+    m_videoListModel.clear();
+    // mpv reports one track per HLS variant itself, so this row would be a duplicate.
+    if (m_videosToBeAdded.count() > 1) {
+        m_videoListModel.append(m_videosToBeAdded[0].url,
+                                m_videosToBeAdded[0].title,
+                                m_videosToBeAdded[0].lang,
+                                m_videosToBeAdded[0].height);
+        for (int i = 1; i < m_videosToBeAdded.count(); i++)
+            addVideo(m_videosToBeAdded[i]);
+    }
+    m_videosToBeAdded.clear();
+    m_audioListModel.clear();
+    for (int i = 0; i < m_audiosToBeAdded.size(); ++i)
+        addAudio(m_audiosToBeAdded[i], /*select=*/i == 0);
+    m_audiosToBeAdded.clear();
+
+    m_subtitleListModel.clear();
+    if (!m_externalSubIds.isEmpty()) { m_externalSubIds.clear(); emit externalSubsChanged(); }
+    m_pendingSubPath.clear();
+    if (m_primarySubId != 0)   { m_primarySubId = 0;   emit primarySubIdChanged(); }
+    if (m_secondarySubId != 0) { m_secondarySubId = 0; emit secondarySubIdChanged(); }
+    for (const auto &sub : std::as_const(m_subtitlesToBeAdded))
+        addSubtitle(sub);
+    m_subtitlesToBeAdded.clear();
+
+    setLoading(false);
+    emit fileLoaded();
+    emit mpvStateChanged();
+
+    ensureDanmaku();
+    // Neither the fetch nor the per-show preference has necessarily settled. Keyed to this
+    // episode, or a quick skip refetches for the one already left behind.
+    QTimer::singleShot(2000, this, [this, key = m_danmakuKey]() {
+        if (key == m_danmakuKey) ensureDanmaku();
+    });
+}
+
+void MpvPlayer::ensureDanmaku() {
+    if (m_state == Stopped || m_danmakuKey.isEmpty() || !m_danmakuSource) return;
+    if (!DanmakuOptions::current().enabled) return;
+    if (danmakuTrackIndex() >= 0) return;
+    if (m_danmakuWriter.isRunning()) return;
+    if (m_danmaku.isEmpty()) { startDanmakuFetch(); return; }
+    writeDanmaku();
+}
+
+void MpvPlayer::onEndFile(const mpv_event *event) {
+    auto *ef = static_cast<mpv_event_end_file *>(event->data);
+    if (m_openPending) return;   // the file open() is replacing
+    handleMpvError(ef->error);
+    m_endFileReason = static_cast<mpv_end_file_reason>(ef->reason);
+    setLoading(false);
+    if (std::exchange(m_nextIn, -1) != -1) emit nextInChanged();
+    if (m_endFileReason == MPV_END_FILE_REASON_STOP) {
+        // Stopped outright, not replaced: the bar has no time or length to show any more.
+        m_time.store(0, std::memory_order_relaxed);
+        m_duration.store(0, std::memory_order_relaxed);
+        m_bufferedTime = 0;
+        emit timeChanged();
+        emit durationChanged();
+        emit bufferedTimeChanged();
+    }
+    if (m_endFileReason == MPV_END_FILE_REASON_ERROR)
+        emit playbackError();
+    else if (m_endFileReason == MPV_END_FILE_REASON_EOF && !m_playNextEmitted) {
+        m_playNextEmitted = true;
+        emit playNext();
+    }
+}
+
+void MpvPlayer::onIdle() {
+    m_state = Stopped;
+    emit mpvStateChanged();
+}
+
+void MpvPlayer::onVideoReconfig() {
+    int64_t width = 0, height = 0;
+    // dheight can lag dwidth.
+    if (!m_mpv.get_int64("dwidth", width) || !m_mpv.get_int64("dheight", height)) return;
+
+    const int w = int(width);
+    const int h = int(height);
+    m_videoWidth.store(w, std::memory_order_relaxed);
+    m_videoHeight.store(h, std::memory_order_relaxed);
+    emit videoSizeChanged();
+    update();
+
+    const QSizeF item = size();
+    if (h > 0 && item.height() > 0)
+        logInfo() << "Video" << QStringLiteral("%1x%2 (%3) into %4x%5 (%6)")
+                              .arg(w).arg(h).arg(double(w) / h, 0, 'f', 3)
+                              .arg(int(item.width())).arg(int(item.height()))
+                              .arg(item.width() / item.height(), 0, 'f', 3);
+}
+
+// HE-AACv2 throws these every audio frame.
+static bool isDecoderNoise(const QString &text) {
+    static const char *ignored[] = {
+        "Reserved SBR extensions is not implemented",
+        "upload a sample of this file",
+        "ffmpeg-devel",
+        "illegal icc",
+        "illegal iid",
+        "border_position non monotone",
+        "may have been wrapped",
+    };
+    for (const char *needle : ignored)
+        if (text.contains(QLatin1String(needle), Qt::CaseInsensitive)) return true;
+    return false;
+}
+
+void MpvPlayer::onLogMessage(const mpv_event *event) {
+    if (!Settings::instance().mpvLogEnabled()) return;
+    auto *msg = static_cast<mpv_event_log_message *>(event->data);
+    static QString lastMsgText;
+    auto msgText = QString::fromUtf8(msg->text).trimmed();
+    if (msgText.isEmpty() || msgText == lastMsgText || isDecoderNoise(msgText)) return;
+    lastMsgText = msgText;
+    logRaw() << "MPV" << msgText;
+}
+
+void MpvPlayer::onPropertyChange(const mpv_event *event) {
+    auto *prop = static_cast<mpv_event_property *>(event->data);
+    if (prop->data == nullptr) return;
+
+    const Mpv::Node &value = *static_cast<Mpv::Node *>(prop->data);
+    if (value.type() == MPV_FORMAT_NONE) return;
+
+    switch (static_cast<Observed>(event->reply_userdata)) {
+    case Observed::PlaybackTime:
+        onPlaybackTime(static_cast<double>(value));
+        break;
+
+    case Observed::Duration:
+        m_duration.store(static_cast<double>(value), std::memory_order_relaxed);
+        emit durationChanged();
+        rebuildDanmakuHeat();
+        applyPendingSeek();
+        break;
+
+    case Observed::SubtitleDelay:
+        // mpv's z/Z bindings move this too, and operator double() asserts.
+        if (value.type() == MPV_FORMAT_DOUBLE) {
+            const double delay = static_cast<double>(value);
+            if (!qFuzzyCompare(m_subDelay + 1.0, delay + 1.0)) {
+                m_subDelay = delay;
+                emit subDelayChanged();
+            }
+        }
+        break;
+
+    case Observed::Pause:
+        if (value && m_state == Playing) {
+            m_state = Paused;
+            allowDisplaySleep();
+        } else if (!value && m_state == Paused) {
+            m_state = Playing;
+            keepDisplayAwake();
+        }
+        emit mpvStateChanged();
+        break;
+
+    case Observed::PausedForCache:
+        m_buffering = bool(value);
+        emit bufferingChanged();
+        break;
+
+    case Observed::CacheEnd:
+        m_bufferedTime = value.type() == MPV_FORMAT_DOUBLE ? static_cast<double>(value) : 0;
+        emit bufferedTimeChanged();
+        break;
+
+    // keep-open stops on the last frame, whose time can fall short of the duration, so the end
+    // is mpv's to say.
+    case Observed::EofReached:
+        if (value && !m_playNextEmitted) {
+            m_playNextEmitted = true;
+            emit playNext();
+        }
+        break;
+
+    case Observed::LoopA:
+    case Observed::LoopB: {
+        // "no" while unset.
+        const double point = value.type() == MPV_FORMAT_DOUBLE ? static_cast<double>(value) : -1;
+        (static_cast<Observed>(event->reply_userdata) == Observed::LoopA ? m_loopA : m_loopB) = point;
+        emit abLoopChanged();
+        break;
+    }
+
+    case Observed::BaseIdle:
+        if (value && m_state == Playing) showText(tr("Pausing..."));
+        break;
+
+    case Observed::AudioId:
+        if (value.type() == MPV_FORMAT_INT64)
+            m_audioListModel.setCurrentId(static_cast<int64_t>(value));
+        break;
+
+    case Observed::VideoId:
+        if (value.type() == MPV_FORMAT_INT64)
+            m_videoListModel.setCurrentId(static_cast<int64_t>(value));
+        break;
+
+    case Observed::SubtitleId: {
+        const qint64 id = value.type() == MPV_FORMAT_INT64 ? static_cast<int64_t>(value) : 0;
+        if (id != 0) m_subtitleListModel.setCurrentId(id);
+        else         m_subtitleListModel.setCurrentIndex(-1);
+        if (m_primarySubId != id) { m_primarySubId = id; emit primarySubIdChanged(); applySubLayout(); }
+        break;
+    }
+
+    case Observed::SecondarySubtitleId: {
+        const qint64 id = value.type() == MPV_FORMAT_INT64 ? static_cast<int64_t>(value) : 0;
+        m_subtitleListModel.setSecondaryIndex(id != 0 ? m_subtitleListModel.indexForId(id) : -1);
+        if (m_secondarySubId != id) { m_secondarySubId = id; emit secondarySubIdChanged(); applySubLayout(); }
+        break;
+    }
+
+    case Observed::SecondarySubtitleText: {
+        const QString text = value.type() == MPV_FORMAT_STRING ? QString(value) : QString();
+        if (const int lines = text.isEmpty() ? 0 : text.count(QChar(0x0a)) + 1; lines != m_secondarySubLines) {
+            m_secondarySubLines = lines;
+            applySubLayout();
+        }
+        break;
+    }
+
+    case Observed::SubtitleScale:
+        if (value.type() == MPV_FORMAT_DOUBLE) {
+            m_subScale = double(value);
+            applySubLayout();
+        }
+        break;
+
+    case Observed::TrackList:
+        parseTrackList(value);
+        break;
+
+    case Observed::GlslShaders: {
+        bool clamp = false;
+        if (value.type() == MPV_FORMAT_NODE_ARRAY) {
+            for (int i = 0; i < value.size() && !clamp; ++i) {
+                const Mpv::Node &shader = value[i];
+                if (shader.type() == MPV_FORMAT_STRING)
+                    clamp = strstr(static_cast<const char *>(shader), "AutoDownscalePre") != nullptr;
+            }
+        }
+        if (clamp != m_bandClamp.load(std::memory_order_relaxed)) {
+            m_bandClamp.store(clamp, std::memory_order_relaxed);
+            update();
+        }
+        break;
+    }
+    }
+}
+
+void MpvPlayer::onPlaybackTime(double time) {
+    if (!std::isfinite(time)) return;
+    if (time == m_time.load(std::memory_order_relaxed)) return;
+    m_time.store(time, std::memory_order_relaxed);
+    emit timeChanged();
+    applyAutoSkip(time);
+}
+
+// The settings reads stay behind the window checks: this runs once a second.
+void MpvPlayer::applyAutoSkip(double time) {
+    const double duration = preciseDuration();
+    const bool hasAniSkip = hasOP() || hasED();
+
+    const int64_t edLength = hasAniSkip ? m_aniEDLength : m_EDLength;
+    const bool hasOutro = edLength > 0 && edLength < duration;
+    // The end, or the outro when it is skipped; asked only near it.
+    double endAt = duration;
+    if (hasOutro && time > duration - edLength - 60
+        && (hasED() ? Settings::instance().aniskipAuto() : m_skipED))
+        endAt = duration - edLength;
+    // duration is 0 for live streams
+    const int nextIn = duration > 0 && !m_playNextEmitted && endAt - time <= 60
+                     ? int(std::ceil(std::max(0.0, endAt - time))) : -1;
+    if (nextIn != m_nextIn) {
+        m_nextIn = nextIn;
+        emit nextInChanged();
+    }
+    if (!m_playNextEmitted && duration > 0 && time >= endAt) {
+        m_playNextEmitted = true;
+        emit playNext();
+        return;
+    }
+
+    const int64_t opStart = hasAniSkip ? m_aniOPStart : m_OPStart;
+    const int64_t opEnd   = opStart + (hasAniSkip ? m_aniOPLength : m_OPLength);
+    if (opEnd > opStart && time >= opStart && time < opEnd && opEnd <= duration
+        && (hasOP() ? Settings::instance().aniskipAuto() : m_skipOP))
+        seek(opEnd, true);
+}
+
+// A drive letter parses as a scheme, and external tracks then keep a stale id.
+static QUrl externalTrackUrl(const QString &raw) {
+    const QUrl parsed(raw);
+    if (parsed.scheme().size() > 1) return parsed;
+    return QUrl::fromLocalFile(QDir::fromNativeSeparators(raw));
+}
+
+struct TrackInfo {
+    QString type;
+    int64_t id = -1;
+    QString title, lang, codec;
+    QUrl    url;
+    int64_t w = 0, h = 0;
+    int64_t channels = 0, bitrate = 0;
+    double  fps = 0.0;
+};
+
+QString prettyCodec(const QString &codec) {
+    if (codec.isEmpty()) return {};
+    static const QMap<QString, QString> names{
+        {"aac", "AAC"},   {"ac3", "AC3"},   {"eac3", "E-AC3"}, {"truehd", "TrueHD"},
+        {"dts", "DTS"},   {"opus", "Opus"}, {"vorbis", "Vorbis"}, {"flac", "FLAC"},
+        {"mp3", "MP3"},   {"subrip", "SRT"}, {"ass", "ASS"},   {"ssa", "SSA"},
+        {"webvtt", "WebVTT"}, {"hdmv_pgs_subtitle", "PGS"}, {"dvd_subtitle", "VobSub"},
+        {"mov_text", "Text"},
+    };
+    if (const QString name = names.value(codec.toLower()); !name.isEmpty()) return name;
+    if (codec.startsWith(QLatin1String("pcm"), Qt::CaseInsensitive)) return QStringLiteral("PCM");
+    return codec.toUpper();
+}
+
+QString channelLayout(int64_t channels) {
+    switch (channels) {
+    case 0:  return {};
+    case 1:  return QStringLiteral("mono");
+    case 2:  return QStringLiteral("stereo");
+    case 6:  return QStringLiteral("5.1");
+    case 8:  return QStringLiteral("7.1");
+    default: return QString("%1 ch").arg(channels);
+    }
+}
+
+// sub-auto=fuzzy pulls in sidecars with no title and no language.
+QString externalBaseName(const QUrl &url) {
+    if (url.isEmpty()) return {};
+    return QFileInfo(url.isLocalFile() ? url.toLocalFile() : url.path()).completeBaseName();
+}
+
+QString trackLabel(const TrackInfo &t) {
+    const bool isVideo = t.type == QLatin1String("video");
+    const QString name = !t.title.isEmpty() ? t.title : externalBaseName(t.url);
+    QString label;
+
+    if (isVideo) {
+        QString resolution;
+        if (t.w > 0 && t.h > 0) {
+            resolution = QString("%1x%2").arg(t.w).arg(t.h);
+            if (t.fps > 0) resolution += QString(" %1FPS").arg(t.fps);
+        }
+        if (resolution.isEmpty()) resolution = prettyCodec(t.codec);
+        label = (!name.isEmpty() && !resolution.isEmpty()) ? QString("%1 [%2]").arg(name, resolution)
+              : name.isEmpty()                             ? resolution
+                                                           : name;
+        if (!t.lang.isEmpty())
+            label = label.isEmpty() ? t.lang : QString("%1 (%2)").arg(label, t.lang);
+        if (t.bitrate > 0) {
+            if (!label.isEmpty()) label += " - ";
+            label += QString("%1 kbps").arg(t.bitrate / 1000);
+        }
+        return label.isEmpty() ? QString("Video %1").arg(t.id) : label;
+    }
+
+    if (!name.isEmpty()) {
+        label = (t.lang.isEmpty() || name.compare(t.lang, Qt::CaseInsensitive) == 0)
+                    ? name : QString("%1 [%2]").arg(name, t.lang);
+    } else {
+        QStringList parts;
+        if (const QString codec = prettyCodec(t.codec); !codec.isEmpty()) parts << codec;
+        if (t.type == QLatin1String("audio"))
+            if (const QString channels = channelLayout(t.channels); !channels.isEmpty()) parts << channels;
+        const QString description = parts.join(QChar(' '));
+        label = t.lang.isEmpty()       ? description
+              : description.isEmpty()  ? t.lang
+                                       : QString("%1 - %2").arg(t.lang, description);
+    }
+
+    if (t.type == QLatin1String("audio") && t.bitrate > 0) {
+        if (!label.isEmpty()) label += " - ";
+        label += QString("%1 kbps").arg(t.bitrate / 1000);
+    }
+    if (!label.isEmpty()) return label;
+    return t.type == QLatin1String("audio") ? QString("Audio %1").arg(t.id)
+                                            : QString("Subtitle %1").arg(t.id);
+}
+
+void MpvPlayer::parseTrackList(const Mpv::Node &trackList) {
+    for (const Mpv::Node &track : trackList) {
+        try {
+            QString trackType = static_cast<const char *>(track["type"]);
+            TrackListModel *listModel = nullptr;
+
+            if (trackType == "sub")        listModel = &m_subtitleListModel;
+            else if (trackType == "audio") listModel = &m_audioListModel;
+            else if (trackType == "video") listModel = &m_videoListModel;
+            else continue;
+
+            int64_t id = -1;
+            QString title, lang, codec;
+            QUrl url;
+            double fps = 0.0;
+            int64_t bitrate = 0, w = 0, h = 0, channels = 0;
+
+            auto map = track.list();
+            for (int i = 0; i < map->num; i++) {
+                const char *key = map->keys[i];
+                mpv_node &v = map->values[i];
+
+                if (strcmp(key, "id") == 0 && v.format == MPV_FORMAT_INT64)
+                    id = v.u.int64;
+                else if (strcmp(key, "title") == 0 && v.format == MPV_FORMAT_STRING)
+                    title = QString::fromUtf8(v.u.string);
+                else if (strcmp(key, "lang") == 0 && v.format == MPV_FORMAT_STRING)
+                    lang = QString::fromUtf8(v.u.string);
+                else if (strcmp(key, "external-filename") == 0 && v.format == MPV_FORMAT_STRING)
+                    url = externalTrackUrl(QString::fromUtf8(v.u.string));
+                else if (strcmp(key, "demux-fps") == 0 && v.format == MPV_FORMAT_DOUBLE)
+                    fps = v.u.double_;
+                else if ((strcmp(key, "demux-bitrate") == 0 || strcmp(key, "hls-bitrate") == 0) && v.format == MPV_FORMAT_INT64) {
+                    if (bitrate == 0) bitrate = v.u.int64;
+                }
+                else if (strcmp(key, "demux-w") == 0 && v.format == MPV_FORMAT_INT64)
+                    w = v.u.int64;
+                else if (strcmp(key, "demux-h") == 0 && v.format == MPV_FORMAT_INT64)
+                    h = v.u.int64;
+                else if (strcmp(key, "codec") == 0 && v.format == MPV_FORMAT_STRING)
+                    codec = QString::fromUtf8(v.u.string);
+                else if (strcmp(key, "demux-channel-count") == 0 && v.format == MPV_FORMAT_INT64)
+                    channels = v.u.int64;
+            }
+
+            if (id <= 0) continue;
+
+            if (listModel == &m_subtitleListModel && url.isLocalFile()) {
+                const QString path = QDir::cleanPath(url.toLocalFile());
+                if (auto it = m_externalSubIds.find(path); it != m_externalSubIds.end()) {
+                    if (*it != id) {
+                        *it = id;
+                        emit externalSubsChanged();
+                        if (m_pendingSubPath == path) {
+                            setSubSlot(!m_pendingSubSecondary, id);
+                            m_pendingSubPath.clear();
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if (!url.isEmpty())
+                listModel->setId(url, id);
+
+            // mpv names an untitled sidecar after the part of the filename the video lacks.
+            if (!url.isEmpty() && !title.isEmpty()) {
+                const QString suffix =
+                    QFileInfo(url.isLocalFile() ? url.toLocalFile() : url.path()).suffix();
+                if (!suffix.isEmpty()) {
+                    if (title.compare(suffix, Qt::CaseInsensitive) == 0)
+                        title.clear();
+                    else if (title.endsWith(QLatin1Char('.') + suffix, Qt::CaseInsensitive))
+                        title.chop(suffix.size() + 1);
+                }
+            }
+
+            const TrackInfo info{trackType, id, title, lang, codec, url, w, h, channels, bitrate, fps};
+            const bool derived = title.isEmpty();
+            const QString label = trackLabel(info);
+
+            if (listModel->indexForId(id) < 0)
+                listModel->append(id, label, lang, derived);
+            else if (!listModel->hasFinalTitle(id))
+                listModel->updateById(id, label, derived);
+
+            listModel->setStats(id, static_cast<int>(h), fps, static_cast<int>(bitrate));
+
+        } catch (const std::exception &e) {
+            logRaw() << "MPV" << e.what();
+        }
+    }
+    m_videoListModel.sortByQuality(true);
+    m_audioListModel.sortByQuality(false);
+
+    // mpv can report vid/aid/sid before the tracks exist, and the pending id is lost on clear.
+    auto syncSelection = [this](const char *prop, TrackListModel &model) {
+        // "no" when nothing is selected, which a typed read reports as a failure.
+        if (int64_t id = 0; m_mpv.get_int64(prop, id)) model.setCurrentId(id);
+    };
+    syncSelection("vid", m_videoListModel);
+    syncSelection("aid", m_audioListModel);
+    syncSelection("sid", m_subtitleListModel);
+
+    restoreTrackPrefs();
+}
+
+void MpvPlayer::setMpvProperty(const QString &name, const QVariant &value) {
+    QByteArray nameData = name.toLatin1();
+    switch (value.typeId()) {
+    case QMetaType::Bool:
+        m_mpv.set_property_async(nameData.constData(), value.toBool());
+        break;
+    case QMetaType::Int:
+    case QMetaType::Long:
+    case QMetaType::LongLong:
+        m_mpv.set_property_async(nameData.constData(), value.toLongLong());
+        break;
+    case QMetaType::Float:
+    case QMetaType::Double:
+        m_mpv.set_property_async(nameData.constData(), value.toDouble());
+        break;
+    case QMetaType::QByteArray: {
+        QByteArray v = value.toByteArray();
+        m_mpv.set_property_async(nameData.constData(), v.constData());
+        break;
+    }
+    case QMetaType::QString: {
+        QByteArray v = value.toString().toUtf8();
+        m_mpv.set_property_async(nameData.constData(), v.constData());
+        break;
+    }
+    }
+}
+
+void MpvPlayer::handleMpvError(int code) {
+    if (code < 0) {
+        if (m_lastMpvError == code) {
+            stop();
+            m_lastMpvError = MPV_ERROR_SUCCESS;
+            return;
+        }
+        m_lastMpvError = code;
+        AppShell::instance().reportError(mpv_error_string(code),
+                                         tr("mpv error %1").arg(code));
+    }
+}
+
+void MpvPlayer::showText(const QString &text) {
+    QByteArray data = text.toUtf8();
+    const char *args[] = {"show-text", data.constData(), nullptr};
+    m_mpv.command_async(args);
+}
+
+QQuickFramebufferObject::Renderer *MpvPlayer::createRenderer() const {
+    QQuickWindow *win = window();
+    Q_ASSERT(win != nullptr);
+    win->setPersistentGraphics(true);
+    win->setPersistentSceneGraph(true);
+    return new MpvRenderer(const_cast<MpvPlayer *>(this));
+}
+
+void MpvPlayer::setHeaders(const QMap<QString, QString> &headers) {
+    m_playbackHeaders = headers;
+    m_mpv.set_property("referrer", "");
+    m_mpv.set_property("user-agent", "");
+    m_mpv.set_property("http-header-fields", "");
+    m_mpv.set_property("stream-lavf-o", "");
+    if (headers.isEmpty()) return;
+
+    QStringList extra;
+    for (auto it = headers.constBegin(); it != headers.constEnd(); ++it) {
+        const QString key = it.key().toLower();
+        if (key == "user-agent")
+            m_mpv.set_property("user-agent", it.value().toUtf8().constData());
+        else if (key == "referrer" || key == "referer")
+            m_mpv.set_property("referrer", it.value().toUtf8().constData());
+        // The UA/referrer options miss ffmpeg's HLS segments.
+        extra << QStringLiteral("%1: %2").arg(it.key(), it.value());
+    }
+    if (!extra.isEmpty())
+        m_mpv.set_property("http-header-fields", extra.join(",").toUtf8().constData());
+}
+
+void MpvPlayer::setSkipOP(bool skip) {
+    m_skipOP = skip;
+    emit skipOPChanged();
+}
+
+void MpvPlayer::setSkipED(bool skip) {
+    m_skipED = skip;
+    emit skipEDChanged();
+}
+
+void MpvPlayer::setOPStart(qint64 start) {
+    m_OPStart = start;
+    emit skipOPStartChanged();
+}
+
+void MpvPlayer::setOPLength(qint64 length) {
+    m_OPLength = length;
+    emit skipOPLengthChanged();
+}
+
+void MpvPlayer::setEDLength(qint64 length) {
+    m_EDLength = length;
+    emit skipEDLengthChanged();
+}
+
+void MpvPlayer::setAudioIndex(int index) {
+    if (index < 0 || index >= m_audioListModel.count()) return;
+    // mpv has not reported this track yet, and "aid -3" would clear the audio outright.
+    if (!m_audioListModel.hasRealId(index)) { m_audioListModel.setCurrentIndex(index); return; }
+    m_mpv.set_property_async("aid", m_audioListModel.idForIndex(index));
+    m_audioListModel.setCurrentIndex(index);
+    if (!m_applyingTrackPrefs) { m_audioPrefApplied = true; saveTrackPrefs(); }
+}
+
+void MpvPlayer::setSubSlot(bool primary, qint64 id) {
+    // mpv rejects a placeholder written into sid verbatim.
+    if (id < 0) return;
+    qint64 &slot = primary ? m_primarySubId : m_secondarySubId;
+    qint64 &other = primary ? m_secondarySubId : m_primarySubId;
+    if (slot == id) return;
+    const qint64 previous = slot;
+
+    if (id != 0 && other == id) setSubSlot(!primary, 0);
+
+    slot = id;
+    const char *property = primary ? "sid" : "secondary-sid";
+    if (id == 0) m_mpv.set_property_async(property, "no");
+    else         m_mpv.set_property_async(property, int64_t(id));
+
+    if (primary) {
+        m_subtitleListModel.setCurrentIndex(m_subtitleListModel.indexForId(id));
+        emit primarySubIdChanged();
+    } else {
+        m_subtitleListModel.setSecondaryIndex(m_subtitleListModel.indexForId(id));
+        emit secondarySubIdChanged();
+    }
+
+    if (id != 0 && !m_subVisible) setSubVisible(true);
+    else if (m_primarySubId == 0 && m_secondarySubId == 0 && m_subVisible) setSubVisible(false);
+
+    applySubLayout();
+    if (m_applyingTrackPrefs) return;
+
+    const QString path = pathForSubId(id);
+    if (!path.isEmpty()) rememberEpisodeSub(path);
+    if (primary) {
+        if (id != 0) m_subRestored = true;
+        else if (!pathForSubId(previous).isEmpty()) rememberEpisodeSub({});
+    }
+    saveTrackPrefs();
+}
+
+void MpvPlayer::setPrimarySub(qint64 id)   { setSubSlot(true, id); }
+void MpvPlayer::setSecondarySub(qint64 id) { setSubSlot(false, id); }
+
+qint64 MpvPlayer::externalSubId(const QString &path) const {
+    return m_externalSubIds.value(QDir::cleanPath(path), 0);
+}
+
+QString MpvPlayer::subNameForId(qint64 id) const {
+    if (const int row = m_subtitleListModel.indexForId(id); row >= 0)
+        if (const Track *track = m_subtitleListModel.at(row))
+            return track->title.isEmpty() ? track->lang : track->title;
+    const QString path = pathForSubId(id);
+    return path.isEmpty() ? QString() : QFileInfo(path).completeBaseName();
+}
+
+void MpvPlayer::setSubIndex(int index, bool secondary) {
+    if (index < 0 || index >= m_subtitleListModel.count()) return;
+    if (!m_subtitleListModel.hasRealId(index)) return;
+    setSubSlot(!secondary, m_subtitleListModel.idForIndex(index));
+}
+
+void MpvPlayer::useExternalSubtitle(const QString &path, const QString &title,
+                                    const QString &lang, bool secondary) {
+    if (path.isEmpty() || m_state == Stopped) return;
+    const QString key = QDir::cleanPath(path);
+    if (QFileInfo(key).size() <= 0) return;
+    if (const qint64 known = m_externalSubIds.value(key, 0); known != 0) {
+        setSubSlot(!secondary, known);
+        return;
+    }
+    m_externalSubIds.insert(key, 0);
+    m_pendingSubPath = key;
+    m_pendingSubSecondary = secondary;
+    emit externalSubsChanged();
+
+    const QByteArray file = QDir::toNativeSeparators(key).toUtf8();
+    const QByteArray t = title.toUtf8(), l = lang.toUtf8();
+    // "auto", not "select": the slot is applied on the id.
+    const char *args[] = {"sub-add", file.constData(), "auto", t.constData(), l.constData(), nullptr};
+    m_mpv.command_async(args);
+}
+
+QString MpvPlayer::pathForSubId(qint64 id) const {
+    if (id == 0) return {};
+    for (auto it = m_externalSubIds.constBegin(); it != m_externalSubIds.constEnd(); ++it)
+        if (it.value() == id) return it.key();
+    return {};
+}
+
+void MpvPlayer::rememberEpisodeSub(const QString &path) const {
+    if (m_episodeKey.isEmpty()) return;
+    Settings::instance().setValue(Config::episodeSub(m_episodeKey), path);
+}
+
+// One line spans 5.3% of frame height per unit of sub-scale.
+void MpvPlayer::applySubLayout() {
+    int gap = 0;
+    if (m_primarySubId != 0 && m_secondarySubId != 0) {
+        const int lines = qMax(1, m_secondarySubLines);
+        gap = int(std::ceil(m_subScale * 5.3 * lines));
+    }
+    m_mpv.set_property_async("sub-pos", int64_t(qMax(0, m_subPos - gap)));
+    m_mpv.set_property_async("secondary-sub-pos", int64_t(m_subPos));
+}
+
+void MpvPlayer::setSubPos(int pos) {
+    m_subPos = pos;
+    applySubLayout();
+}
+
+void MpvPlayer::saveTrackPrefs() {
+    if (m_applyingTrackPrefs || m_showKey.isEmpty()) return;
+    const QString key = QStringLiteral("tracks/") + m_showKey;
+    const TrackPrefs stored = TrackPrefs::parse(Settings::instance().value(key).toString());
+
+    // Neither a fetched subtitle nor a derived label is a stable key, so the index carries it.
+    auto subtitleTitle = [&](const QString &keptWhenExternal, int index, qint64 id) {
+        if (!pathForSubId(id).isEmpty()) return keptWhenExternal;
+        const Track *track = m_subtitleListModel.at(index);
+        if (!track) return QString();
+        return m_subtitleListModel.isDerivedTitle(m_subtitleListModel.idForIndex(index))
+                   ? QString() : track->title;
+    };
+
+    const int audioIndex = m_audioListModel.currentIndex();
+    const Track *audio = m_audioListModel.at(audioIndex);
+    const bool audioTitled = audio && !m_audioListModel.isDerivedTitle(m_audioListModel.idForIndex(audioIndex));
+
+    const QList<int> heights = m_videoListModel.heights();
+    const int videoIndex = m_videoListModel.currentIndex();
+    const int videoHeight = (videoIndex >= 0 && videoIndex < heights.size()) ? heights[videoIndex] : -1;
+    int videoWithinHeight = 0;
+    for (int i = 0; i < videoIndex && i < heights.size(); ++i)
+        if (heights[i] == videoHeight) videoWithinHeight++;
+
+    // Storing it would restore "弹幕" as the saved subtitle with danmaku off.
+    const int danmakuIndex = danmakuTrackIndex();
+    const int subtitleIndex = m_subtitleListModel.currentIndex() == danmakuIndex
+                                  ? stored.subtitleIndex : m_subtitleListModel.currentIndex();
+
+    TrackPrefs prefs;
+    prefs.subtitleTitle = m_subtitleListModel.currentIndex() == danmakuIndex
+                              ? stored.subtitleTitle
+                              : subtitleTitle(stored.subtitleTitle, subtitleIndex, m_primarySubId);
+    prefs.audioTitle = audioTitled ? audio->title : QString();
+    prefs.subtitlesVisible = m_subVisible;
+    prefs.videoHeight = videoHeight;
+    prefs.videoWithinHeight = videoWithinHeight;
+    prefs.audioIndex = audioIndex;
+    prefs.secondarySubtitleTitle =
+        subtitleTitle(stored.secondarySubtitleTitle, m_subtitleListModel.secondaryIndex(), m_secondarySubId);
+    prefs.subtitleIndex = subtitleIndex;
+    // Writing 1.0 would pin a show to normal speed.
+    prefs.speed = qFuzzyCompare(double(m_speed), 1.0) ? 0.0 : double(m_speed);
+    prefs.danmaku = m_danmakuKey.isEmpty() ? -1 : (Settings::instance().danmakuEnabled() ? 1 : 0);
+    Settings::instance().setValue(key, prefs.toString());
+}
+
+void MpvPlayer::restoreTrackPrefs() {
+    if (!m_episodeKey.isEmpty() && !m_subRestored) {
+        const QString saved = Settings::instance().value(Config::episodeSub(m_episodeKey)).toString();
+        if (!saved.isEmpty() && QFileInfo(saved).size() > 0 && !m_externalSubIds.contains(saved)) {
+            m_subRestored = true;
+            useExternalSubtitle(saved, QFileInfo(saved).completeBaseName(), {});
+        }
+    }
+
+    if (m_showKey.isEmpty() || (m_subRestored && m_videoPrefApplied && m_audioPrefApplied)) return;
+    const QString stored = Settings::instance().value("tracks/" + m_showKey).toString();
+    if (stored.isEmpty()) { m_subRestored = m_videoPrefApplied = m_audioPrefApplied = true; return; }
+    const TrackPrefs prefs = TrackPrefs::parse(stored);
+
+    // Once per show, on the first pass: later events must not undo a live change.
+    if (!m_speedPrefApplied) {
+        m_speedPrefApplied = true;
+        if (prefs.speed > 0.0) {
+            // Not a change to save: the tracks this would store are not restored yet.
+            m_applyingTrackPrefs = true;
+            setSpeed(float(prefs.speed));
+            m_applyingTrackPrefs = false;
+        }
+        // open() already started the fetch, so flipping it off drops the comments on arrival.
+        if (prefs.danmaku >= 0 && !m_danmakuKey.isEmpty()
+            && Settings::instance().danmakuEnabled() != bool(prefs.danmaku)) {
+            logInfo() << "Danmaku"
+                      << (prefs.danmaku ? "turned on for this show by a saved preference"
+                                        : "turned off for this show by a saved preference");
+            Settings::instance().setDanmakuEnabled(bool(prefs.danmaku));
+        }
+    }
+
+    if (!m_videoPrefApplied) {
+        const int target = TrackPrefs::pickVideo(m_videoListModel.heights(), prefs.videoHeight,
+                                                 prefs.videoWithinHeight);
+        if (target < 0 || m_videoListModel.currentIndex() == target) {
+            m_videoPrefApplied = true;
+        } else if (const int64_t id = m_videoListModel.idForIndex(target); id > 0) {
+            m_mpv.set_property_async("vid", id);
+        }
+    }
+
+    if (!m_audioPrefApplied) {
+        QStringList titles;
+        for (int i = 0; i < m_audioListModel.count(); ++i) titles << m_audioListModel.at(i)->title;
+        const int target = TrackPrefs::pickAudio(titles, prefs.audioTitle, prefs.audioIndex);
+        if (target < 0 || m_audioListModel.currentIndex() == target) {
+            m_audioPrefApplied = true;
+        } else if (const int64_t id = m_audioListModel.idForIndex(target); id > 0) {
+            m_mpv.set_property_async("aid", id);
+        }
+    }
+
+    if (m_subRestored) return;
+    if (!prefs.hasSubtitles) { m_subRestored = true; return; }
+    // Danmaku holds the primary subtitle slot, and this runs on every track-list event, so
+    // without the defer the saved subtitle is reselected straight after sub-add.
+    if (Settings::instance().danmakuEnabled() && danmakuTrackIndex() >= 0) return;
+
+    m_applyingTrackPrefs = true;
+    bool found = true;
+    if (!prefs.subtitleTitle.isEmpty()) {
+        found = false;
+        for (int i = 0; i < m_subtitleListModel.count(); ++i)
+            if (m_subtitleListModel.at(i)->title == prefs.subtitleTitle) { setSubIndex(i); found = true; break; }
+    } else if (prefs.subtitleIndex >= 0 && prefs.subtitleIndex < m_subtitleListModel.count()) {
+        setSubIndex(prefs.subtitleIndex);
+    }
+    if (!prefs.secondarySubtitleTitle.isEmpty())
+        for (int i = 0; i < m_subtitleListModel.count(); ++i)
+            if (m_subtitleListModel.at(i)->title == prefs.secondarySubtitleTitle) {
+                if (m_subtitleListModel.hasRealId(i))
+                    setSecondarySub(m_subtitleListModel.idForIndex(i));
+                break;
+            }
+    setSubVisible(prefs.subtitlesVisible);
+    m_applyingTrackPrefs = false;
+    if (found) m_subRestored = true;
+}
+
+void MpvPlayer::setVideoIndex(int index) {
+    if (index < 0 || index >= m_videoListModel.count()) return;
+    if (!m_videoListModel.hasRealId(index)) { m_videoListModel.setCurrentIndex(index); return; }
+    m_mpv.set_property_async("vid", m_videoListModel.idForIndex(index));
+    m_videoListModel.setCurrentIndex(index);
+    auto *track = m_videoListModel.at(index);
+    if (track && !track->url.isEmpty())
+        m_currentVideoUrl = track->url;
+    if (!m_applyingTrackPrefs) { m_videoPrefApplied = true; saveTrackPrefs(); }
+}
+
+void MpvPlayer::setMuted(bool muted) {
+    if (m_muted == muted) return;
+    if (muted) {
+        m_lastVolume = m_volume;
+        setVolume(0);
+    } else {
+        setVolume(m_lastVolume);
+    }
+    m_muted = muted;
+    emit mutedChanged();
+}

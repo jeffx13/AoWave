@@ -1,0 +1,10 @@
+{
+  "name": "app",
+  "version-string": "0.1.0",
+  "description": "Native dependencies, installed at CMake configure time.",
+  "dependencies": [
+    "libxml2",
+    "nayuki-qr-code-generator",
+    "zlib"
+  ]
+}

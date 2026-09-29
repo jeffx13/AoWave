@@ -1,0 +1,34 @@
+# Build trees, Qt Creator's included
+build/
+vcpkg_installed/
+
+# Fetched by scripts/download-tools.ps1, or bundled in releases
+third-parties/bin/
+third-parties/lib/
+third-parties/mpv-config/shaders/
+
+# scripts/package.ps1 output
+/dist/
+
+# Tests and notes for coding agents stay on the developer's machine
+/tests/
+/AGENTS.md
+/CLAUDE.md
+
+# What a copy of the app run from the source tree keeps
+data/
+*.dmp
+
+# Editor and tool state
+.qtcreator/
+CMakeLists.txt.user*
+*.autosave
+.cache/
+.claude/
+.codegraph/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# Local-only scratch: dead providers, credential-bearing scripts, anything not for VC
+/_local/

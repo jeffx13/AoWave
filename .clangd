@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: build/Desktop_Qt_6_12_0_MSVC2022_64bit_Debug
+  # MSVC's precompiled header is a binary clang cannot read; the /FI'd header still applies.
+  Remove: [/Yu*, /Fp*]
+  # clang cannot detect this toolset and would claim MSVC 19.33, where Qt still expects stdext.
+  Add: [-fms-compatibility-version=19.51]
