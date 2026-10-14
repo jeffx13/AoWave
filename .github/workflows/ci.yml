@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: '6.12.0'
+          arch: win64_msvc2022_64
+          modules: qtwebengine qtwebchannel qtpositioning qtshadertools
+          # aqtinstall 3.3.0 cannot read Qt 6.12's repository: the upstream fix (miurahr/aqtinstall#1048).
+          aqtsource: git+https://github.com/jdpurcell/aqtinstall.git@6f0f842da47c744cdc814cd94da9828d934d7bf0
+          cache: true
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - id: deps
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            third-parties/bin
+            third-parties/lib
+          key: deps-${{ hashFiles('scripts/download-tools.ps1') }}
+
+      - name: Fetch the pinned tools and libmpv
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: powershell -ExecutionPolicy Bypass -File scripts/download-tools.ps1
+
+      - name: Configure
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          git -C $env:VCPKG_ROOT fetch -q origin
+          cmake --preset debug -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build --preset debug
+
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - id: version
+        name: Is this version released yet?
+        run: |
+          $version = [regex]::Match((Get-Content CMakeLists.txt -Raw), 'project\(\w+ VERSION ([\d.]+)').Groups[1].Value
+          if (-not $version) { throw "no version in CMakeLists.txt" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          gh release view "v$version" *> $null
+          if ($LASTEXITCODE -eq 0) { "new=false" >> $env:GITHUB_OUTPUT; "v$version is already released" }
+          else { "new=true" >> $env:GITHUB_OUTPUT; "v$version is new" }
+          exit 0
+
+      - if: steps.version.outputs.new == 'true'
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: '6.12.0'
+          arch: win64_msvc2022_64
+          modules: qtwebengine qtwebchannel qtpositioning qtshadertools
+          aqtsource: git+https://github.com/jdpurcell/aqtinstall.git@6f0f842da47c744cdc814cd94da9828d934d7bf0
+          cache: true
+
+      - if: steps.version.outputs.new == 'true'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - if: steps.version.outputs.new == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            third-parties/bin
+            third-parties/lib
+          key: deps-${{ hashFiles('scripts/download-tools.ps1') }}
+
+      - if: steps.version.outputs.new == 'true'
+        name: Package
+        run: |
+          if (-not (Test-Path third-parties\bin\ffmpeg.exe)) { powershell -ExecutionPolicy Bypass -File scripts/download-tools.ps1 }
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          git -C $env:VCPKG_ROOT fetch -q origin
+          $env:QT_DIR = $env:QT_ROOT_DIR
+          powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+
+      - if: steps.version.outputs.new == 'true'
+        name: Publish the release
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          gh release create "v$v" (Get-ChildItem dist\*.zip).FullName --title "AoWave $v" --generate-notes --target $env:GITHUB_SHA
