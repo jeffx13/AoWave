@@ -1,0 +1,15 @@
+build/
+vcpkg_installed/
+third-parties/bin/
+third-parties/lib/
+third-parties/mpv-config/shaders/
+/dist/
+data/
+*.dmp
+.qtcreator/
+CMakeLists.txt.user*
+*.autosave
+.cache/
+.ruff_cache/
+__pycache__/
+*.pyc
