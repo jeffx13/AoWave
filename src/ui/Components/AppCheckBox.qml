@@ -1,0 +1,70 @@
+import QtQuick
+import QtQuick.Controls
+
+CheckBox {
+    id: control
+
+    property int fontSize: Theme.bodySize
+    readonly property int boxSize: Ui.sp(22)
+    readonly property bool marked: checkState !== Qt.Unchecked
+    readonly property bool hasText: text.length > 0
+    readonly property bool overlay: Ui.inOverlay(control)
+
+    implicitWidth: boxSize + (hasText ? spacing + Math.ceil(label.implicitWidth) : 0) + leftPadding + rightPadding
+    implicitHeight: Math.max(boxSize, hasText ? label.implicitHeight : 0) + 8
+    leftPadding: 0
+    rightPadding: 0
+    spacing: hasText ? 10 : 0
+    hoverEnabled: true
+    focusPolicy: Qt.TabFocus
+    Accessible.name: text || Ui.labelOf(control)
+    Keys.onPressed: event => Ui.clickOnEnter(event, control)
+
+    indicator: Rectangle {
+        implicitWidth: control.boxSize
+        implicitHeight: control.boxSize
+        x: control.hasText ? control.leftPadding : (control.width - width) / 2
+        anchors.verticalCenter: parent.verticalCenter
+        radius: 6
+        color: control.marked ? Theme.accent : control.overlay ? Theme.overlayFill : Theme.surface
+        border.color: control.marked ? Qt.lighter(Theme.accent, 1.2)
+                    : control.hovered ? (control.overlay ? Theme.onOverlayDim : Theme.textMuted)
+                    : control.overlay ? Theme.overlayFillActive : Theme.border
+        border.width: 1
+        opacity: control.enabled ? 1 : 0.5
+
+        Behavior on color { ColorAnimation { duration: Theme.dur(140) } }
+        Behavior on border.color { ColorAnimation { duration: Theme.dur(140) } }
+
+        FocusRing { shown: control.visualFocus; radius: 9 }
+
+        AppIcon {
+            anchors.centerIn: parent
+            name: control.checkState === Qt.PartiallyChecked ? "minus" : "check"
+            size: Math.round(parent.height * 0.62)
+            color: Theme.accentInk
+            visible: control.marked
+            opacity: control.marked ? 1.0 : 0.0
+            scale: control.marked ? 1.0 : 0.5
+            Behavior on opacity { NumberAnimation { duration: Theme.dur(120) } }
+            Behavior on scale { NumberAnimation { duration: Theme.dur(160); easing.type: Easing.OutCubic } }
+        }
+    }
+
+    contentItem: Text {
+        id: label
+        visible: control.hasText
+        leftPadding: control.hasText ? control.boxSize + control.spacing : 0
+        text: control.text
+        color: !control.enabled ? Theme.textDisabled
+             : control.overlay ? (control.hovered ? Theme.onOverlay : Theme.onOverlayMuted)
+             : control.hovered ? Theme.textPrimary : Theme.textSecondary
+        font.family: Ui.fontFamily
+        font.pixelSize: Ui.sp(control.fontSize)
+        verticalAlignment: Text.AlignVCenter
+        elide: Text.ElideRight
+        Behavior on color { ColorAnimation { duration: Theme.dur(120) } }
+    }
+
+    HoverHandler { cursorShape: control.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor }
+}
